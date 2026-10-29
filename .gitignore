@@ -5,7 +5,7 @@ venv/
 env/
 build/
 dist/
-*.spec
+ScreenDraw.spec
 .vscode/
 .idea/
 .DS_Store
