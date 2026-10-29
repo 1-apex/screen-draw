@@ -4,10 +4,15 @@ A transparent, always-on-top overlay covers the primary monitor and a small
 floating toolbar controls it. With draw mode off, mouse clicks pass straight
 through to the apps underneath while your drawings stay visible.
 
+The app lives in the system tray; launching it again just brings the toolbar
+back instead of starting a second copy.
+
 Run:  python screen_draw.py
 """
 import ctypes
+import getpass
 import math
+import os
 import sys
 from dataclasses import dataclass, field
 
@@ -17,6 +22,7 @@ from PySide6.QtGui import (
     QCursor,
     QGuiApplication,
     QIcon,
+    QLinearGradient,
     QPainter,
     QPainterPath,
     QPainterPathStroker,
@@ -25,16 +31,27 @@ from PySide6.QtGui import (
     QPolygonF,
     QRadialGradient,
 )
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QFrame,
     QGraphicsDropShadowEffect,
     QLabel,
+    QMenu,
     QPushButton,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
+
+if sys.platform == "win32":
+    import winreg
+
+APP_NAME = "Screen Draw"
+APP_ID = "1apex.ScreenDraw"  # Windows AppUserModelID, groups the app's taskbar/tray identity
+INSTANCE_KEY = f"screen-draw-{getpass.getuser()}"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 PEN, HIGHLIGHTER, LINE, ARROW, RECT, ELLIPSE, ERASER = (
     "pen", "highlighter", "line", "arrow", "rect", "ellipse", "eraser",
@@ -242,6 +259,29 @@ def draw_power(p, fg, accent):
     p.drawLine(QPointF(12, 3.5), QPointF(12, 11))
 
 
+def draw_hide(p, fg, accent):
+    p.setPen(_line(fg, 2))
+    p.setBrush(Qt.NoBrush)
+    p.drawLine(QPointF(12, 4), QPointF(12, 15))
+    p.drawPolyline(_poly((7.5, 10.5), (12, 15), (16.5, 10.5)))
+    p.drawLine(QPointF(5, 19.5), QPointF(19, 19.5))
+
+
+def draw_app_icon(p, fg, accent):
+    """Gradient tile with a white pen, matching the draw-mode button."""
+    tile = QLinearGradient(0, 0, 24, 24)
+    tile.setColorAt(0, QColor("#7b5cff"))
+    tile.setColorAt(1, QColor("#2f8bff"))
+    p.setPen(Qt.NoPen)
+    p.setBrush(tile)
+    p.drawRoundedRect(QRectF(1, 1, 22, 22), 5.5, 5.5)
+    p.translate(12, 12)
+    p.scale(0.75, 0.75)
+    p.translate(-12, -12)
+    white = QColor("#ffffff")
+    draw_pen(p, white, white)
+
+
 def _pixmap(draw, fg, accent, size=ICON_SIZE) -> QPixmap:
     dpr = QGuiApplication.primaryScreen().devicePixelRatio()
     pm = QPixmap(round(size * dpr), round(size * dpr))
@@ -301,6 +341,13 @@ def grip_pixmap() -> QPixmap:
             for y in (9, 15):
                 p.drawEllipse(QPointF(x, y), 1.5, 1.5)
     return _pixmap(draw, ICON_FG, ICON_FG, 24)
+
+
+def app_icon() -> QIcon:
+    icon = QIcon()
+    for size in (16, 20, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(_pixmap(draw_app_icon, "#ffffff", "#ffffff", size))
+    return icon
 
 
 TOOL_ICONS = {
@@ -613,6 +660,7 @@ class Toolbar(QWidget):
         for draw, tip, slot, name in [
             (draw_undo, "Undo", overlay.undo, ""),
             (draw_trash, "Clear all", overlay.clear, "danger"),
+            (draw_hide, "Hide to tray (drawings stay)", self.hide_to_tray, ""),
             (draw_power, "Quit", QApplication.quit, "danger"),
         ]:
             btn = self._button(tip, name=name)
@@ -626,6 +674,25 @@ class Toolbar(QWidget):
         self.adjustSize()
         screen = QGuiApplication.primaryScreen().availableGeometry()
         self.move(screen.left() + 8, screen.center().y() - self.height() // 2)
+
+    def show_toolbar(self):
+        # Pull the toolbar back on screen if a monitor change left it outside.
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        if not screen.intersects(self.frameGeometry()):
+            self.move(screen.left() + 8, screen.center().y() - self.height() // 2)
+        self.show()
+        self.raise_()
+
+    def hide_to_tray(self):
+        # Without the toolbar there'd be no way to leave draw mode, so leave it first.
+        self.overlay.set_drawing(False)
+        self.hide()
+
+    def toggle_visible(self):
+        if self.isVisible():
+            self.hide_to_tray()
+        else:
+            self.show_toolbar()
 
     def _button(self, tip, checkable=False, name="") -> QPushButton:
         btn = QPushButton()
@@ -688,14 +755,114 @@ class Toolbar(QWidget):
         self._drag_offset = None
 
 
+def launch_command() -> str:
+    """Command line that starts this app, for the 'Start with Windows' entry."""
+    if getattr(sys, "frozen", False):  # packaged ScreenDraw.exe
+        return f'"{sys.executable}"'
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return f'"{pythonw}" "{os.path.abspath(__file__)}"'
+
+
+def startup_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, APP_NAME)
+            return True
+    except OSError:
+        return False
+
+
+def set_startup(enabled: bool):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, launch_command())
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+
+
+class Tray(QSystemTrayIcon):
+    """Tray icon: left-click shows/hides the toolbar, right-click opens the menu."""
+
+    def __init__(self, overlay: Overlay, toolbar: Toolbar):
+        super().__init__(app_icon())
+        self.toolbar = toolbar
+        self.setToolTip(APP_NAME)
+
+        self.menu = QMenu()
+        self.show_action = self.menu.addAction("Show toolbar", toolbar.toggle_visible)
+        self.draw_action = self.menu.addAction("Draw mode")
+        self.draw_action.setCheckable(True)
+        self.draw_action.toggled.connect(self._set_drawing)
+        overlay.drawing_changed.connect(self._on_drawing_changed)
+        self.menu.addAction("Clear all", overlay.clear)
+        self.menu.addSeparator()
+        if sys.platform == "win32":
+            startup = self.menu.addAction("Start with Windows")
+            startup.setCheckable(True)
+            startup.setChecked(startup_enabled())
+            startup.toggled.connect(set_startup)
+            self.menu.addSeparator()
+        self.menu.addAction("Quit", QApplication.quit)
+        self.menu.aboutToShow.connect(self._sync_labels)
+        self.setContextMenu(self.menu)
+
+        self.activated.connect(self._on_activated)
+
+    def _set_drawing(self, enabled):
+        if enabled:
+            self.toolbar.show_toolbar()  # drawing needs the toolbar to get back out
+        self.toolbar.overlay.set_drawing(enabled)
+
+    def _on_drawing_changed(self, enabled):
+        self.draw_action.blockSignals(True)
+        self.draw_action.setChecked(enabled)
+        self.draw_action.blockSignals(False)
+
+    def _sync_labels(self):
+        self.show_action.setText("Hide toolbar" if self.toolbar.isVisible() else "Show toolbar")
+
+    def _on_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            self.toolbar.toggle_visible()
+
+
 def main():
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setWindowIcon(app_icon())
     app.setStyleSheet(APP_STYLE)
+    app.setQuitOnLastWindowClosed(False)  # hiding the toolbar must not quit
+
+    # Already running? Ask that copy to show its toolbar and get out of the way.
+    probe = QLocalSocket()
+    probe.connectToServer(INSTANCE_KEY)
+    if probe.waitForConnected(300):
+        probe.write(b"show")
+        probe.waitForBytesWritten(300)
+        return
+
     overlay = Overlay()
     toolbar = Toolbar(overlay)
+    tray = Tray(overlay, toolbar)
+
+    QLocalServer.removeServer(INSTANCE_KEY)
+    server = QLocalServer()
+    server.newConnection.connect(lambda: (server.nextPendingConnection(), toolbar.show_toolbar()))
+    server.listen(INSTANCE_KEY)
+
+    # Keep the startup entry pointing at wherever this copy now lives.
+    if sys.platform == "win32" and startup_enabled():
+        set_startup(True)
+
     overlay.show()
-    toolbar.show()
-    toolbar.raise_()
+    toolbar.show_toolbar()
+    tray.show()
+    app.aboutToQuit.connect(tray.hide)  # don't leave a ghost icon in the tray
     sys.exit(app.exec())
 
 
